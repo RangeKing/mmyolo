@@ -14,6 +14,7 @@ from mmengine.structures import InstanceData
 from torch import Tensor
 
 from mmyolo.registry import MODELS, TASK_UTILS
+from ..utils import gt_instances_preprocess
 from .yolov5_head import YOLOv5Head
 
 
@@ -49,6 +50,7 @@ class YOLOv6HeadModule(BaseModule):
                  in_channels: Union[int, Sequence],
                  widen_factor: float = 1.0,
                  num_base_priors: int = 1,
+                 reg_max=0,
                  featmap_strides: Sequence[int] = (8, 16, 32),
                  norm_cfg: ConfigType = dict(
                      type='BN', momentum=0.03, eps=0.001),
@@ -60,6 +62,7 @@ class YOLOv6HeadModule(BaseModule):
         self.featmap_strides = featmap_strides
         self.num_levels = len(self.featmap_strides)
         self.num_base_priors = num_base_priors
+        self.reg_max = reg_max
         self.norm_cfg = norm_cfg
         self.act_cfg = act_cfg
 
@@ -79,6 +82,12 @@ class YOLOv6HeadModule(BaseModule):
         self.cls_preds = nn.ModuleList()
         self.reg_preds = nn.ModuleList()
         self.stems = nn.ModuleList()
+
+        if self.reg_max > 1:
+            proj = torch.arange(
+                self.reg_max + self.num_base_priors, dtype=torch.float)
+            self.register_buffer('proj', proj, persistent=False)
+
         for i in range(self.num_levels):
             self.stems.append(
                 ConvModule(
@@ -115,7 +124,7 @@ class YOLOv6HeadModule(BaseModule):
             self.reg_preds.append(
                 nn.Conv2d(
                     in_channels=self.in_channels[i],
-                    out_channels=self.num_base_priors * 4,
+                    out_channels=(self.num_base_priors + self.reg_max) * 4,
                     kernel_size=1))
 
     def init_weights(self):
@@ -147,6 +156,7 @@ class YOLOv6HeadModule(BaseModule):
                        cls_pred: nn.Module, reg_conv: nn.Module,
                        reg_pred: nn.Module) -> Tuple[Tensor, Tensor]:
         """Forward feature of a single scale level."""
+        b, _, h, w = x.shape
         y = stem(x)
         cls_x = y
         reg_x = y
@@ -154,9 +164,26 @@ class YOLOv6HeadModule(BaseModule):
         reg_feat = reg_conv(reg_x)
 
         cls_score = cls_pred(cls_feat)
-        bbox_pred = reg_pred(reg_feat)
+        bbox_dist_preds = reg_pred(reg_feat)
 
-        return cls_score, bbox_pred
+        if self.reg_max > 1:
+            bbox_dist_preds = bbox_dist_preds.reshape(
+                [-1, 4, self.reg_max + self.num_base_priors,
+                 h * w]).permute(0, 3, 1, 2)
+
+            # TODO: The get_flops script cannot handle the situation of
+            #  matmul, and needs to be fixed later
+            # bbox_preds = bbox_dist_preds.softmax(3).matmul(self.proj)
+            bbox_preds = bbox_dist_preds.softmax(3).matmul(
+                self.proj.view([-1, 1])).squeeze(-1)
+            bbox_preds = bbox_preds.transpose(1, 2).reshape(b, -1, h, w)
+        else:
+            bbox_preds = bbox_dist_preds
+
+        if self.training:
+            return cls_score, bbox_preds, bbox_dist_preds
+        else:
+            return cls_score, bbox_preds
 
 
 @MODELS.register_module()
@@ -237,6 +264,7 @@ class YOLOv6Head(YOLOv5Head):
             self,
             cls_scores: Sequence[Tensor],
             bbox_preds: Sequence[Tensor],
+            bbox_dist_preds: Sequence[Tensor],
             batch_gt_instances: Sequence[InstanceData],
             batch_img_metas: Sequence[dict],
             batch_gt_instances_ignore: OptInstanceList = None) -> dict:
@@ -290,7 +318,7 @@ class YOLOv6Head(YOLOv5Head):
             self.stride_tensor = self.flatten_priors_train[..., [2]]
 
         # gt info
-        gt_info = self.gt_instances_preprocess(batch_gt_instances, num_imgs)
+        gt_info = gt_instances_preprocess(batch_gt_instances, num_imgs)
         gt_labels = gt_info[:, :, :1]
         gt_bboxes = gt_info[:, :, 1:]  # xyxy
         pad_bbox_flag = (gt_bboxes.sum(-1, keepdim=True) > 0).float()
@@ -366,69 +394,3 @@ class YOLOv6Head(YOLOv5Head):
         _, world_size = get_dist_info()
         return dict(
             loss_cls=loss_cls * world_size, loss_bbox=loss_bbox * world_size)
-
-    @staticmethod
-    def gt_instances_preprocess(batch_gt_instances: Union[Tensor, Sequence],
-                                batch_size: int) -> Tensor:
-        """Split batch_gt_instances with batch size, from [all_gt_bboxes, 6]
-        to.
-
-        [batch_size, number_gt, 5]. If some shape of single batch smaller than
-        gt bbox len, then using [-1., 0., 0., 0., 0.] to fill.
-
-        Args:
-            batch_gt_instances (Sequence[Tensor]): Ground truth
-                instances for whole batch, shape [all_gt_bboxes, 6]
-            batch_size (int): Batch size.
-
-        Returns:
-            Tensor: batch gt instances data, shape [batch_size, number_gt, 5]
-        """
-        if isinstance(batch_gt_instances, Sequence):
-            max_gt_bbox_len = max(
-                [len(gt_instances) for gt_instances in batch_gt_instances])
-            # fill [-1., 0., 0., 0., 0.] if some shape of
-            # single batch not equal max_gt_bbox_len
-            batch_instance_list = []
-            for index, gt_instance in enumerate(batch_gt_instances):
-                bboxes = gt_instance.bboxes
-                labels = gt_instance.labels
-                batch_instance_list.append(
-                    torch.cat((labels[:, None], bboxes), dim=-1))
-
-                if bboxes.shape[0] >= max_gt_bbox_len:
-                    continue
-
-                fill_tensor = bboxes.new_full(
-                    [max_gt_bbox_len - bboxes.shape[0], 5], 0)
-                fill_tensor[:, 0] = -1.
-                batch_instance_list[index] = torch.cat(
-                    (batch_instance_list[-1], fill_tensor), dim=0)
-
-            return torch.stack(batch_instance_list)
-        else:
-            # faster version
-            # sqlit batch gt instance [all_gt_bboxes, 6] ->
-            # [batch_size, number_gt_each_batch, 5]
-            batch_instance_list = []
-            max_gt_bbox_len = 0
-            for i in range(batch_size):
-                single_batch_instance = \
-                    batch_gt_instances[batch_gt_instances[:, 0] == i, :]
-                single_batch_instance = single_batch_instance[:, 1:]
-                batch_instance_list.append(single_batch_instance)
-                if len(single_batch_instance) > max_gt_bbox_len:
-                    max_gt_bbox_len = len(single_batch_instance)
-
-            # fill [-1., 0., 0., 0., 0.] if some shape of
-            # single batch not equal max_gt_bbox_len
-            for index, gt_instance in enumerate(batch_instance_list):
-                if gt_instance.shape[0] >= max_gt_bbox_len:
-                    continue
-                fill_tensor = batch_gt_instances.new_full(
-                    [max_gt_bbox_len - gt_instance.shape[0], 5], 0)
-                fill_tensor[:, 0] = -1.
-                batch_instance_list[index] = torch.cat(
-                    (batch_instance_list[index], fill_tensor), dim=0)
-
-            return torch.stack(batch_instance_list)

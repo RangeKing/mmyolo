@@ -14,6 +14,7 @@ from mmcv.transforms import Compose
 from mmdet.evaluation import get_classes
 from mmdet.utils import ConfigType
 from mmengine.config import Config
+from mmengine.registry import init_default_scope
 from mmengine.runner import load_checkpoint
 from mmengine.structures import InstanceData
 from torch import Tensor
@@ -71,6 +72,7 @@ def init_detector(
     # only change this
     # grad based method requires train_cfg
     # config.model.train_cfg = None
+    init_default_scope(config.get('default_scope', 'mmyolo'))
 
     model = MODELS.build(config.model)
     if checkpoint is not None:
@@ -200,7 +202,10 @@ class BoxAMDetectorWrapper(nn.Module):
         if self.is_need_loss:
             # Maybe this is a direction that can be optimized
             # self.detector.init_weights()
-
+            if hasattr(self.detector.bbox_head, 'head_module'):
+                self.detector.bbox_head.head_module.training = True
+            else:
+                self.detector.bbox_head.training = True
             if hasattr(self.detector.bbox_head, 'featmap_sizes'):
                 # Prevent the model algorithm error when calculating loss
                 self.detector.bbox_head.featmap_sizes = None
@@ -216,6 +221,10 @@ class BoxAMDetectorWrapper(nn.Module):
 
             return [loss]
         else:
+            if hasattr(self.detector.bbox_head, 'head_module'):
+                self.detector.bbox_head.head_module.training = False
+            else:
+                self.detector.bbox_head.training = False
             with torch.no_grad():
                 results = self.detector.test_step(self.input_data)
                 return results

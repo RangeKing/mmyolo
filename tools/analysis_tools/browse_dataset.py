@@ -11,14 +11,15 @@ from mmdet.models.utils import mask2ndarray
 from mmdet.structures.bbox import BaseBoxes
 from mmengine.config import Config, DictAction
 from mmengine.dataset import Compose
+from mmengine.registry import init_default_scope
 from mmengine.utils import ProgressBar
 from mmengine.visualization import Visualizer
 
 from mmyolo.registry import DATASETS, VISUALIZERS
-from mmyolo.utils import register_all_modules
 
 
 # TODO: Support for printing the change in key of results
+# TODO: Some bug. If you meet some bug, please use the original
 def parse_args():
     parser = argparse.ArgumentParser(description='Browse a dataset')
     parser.add_argument('config', help='train config file path')
@@ -43,7 +44,7 @@ def parse_args():
         'the intermediate images. Defaults to "transformed".')
     parser.add_argument(
         '--out-dir',
-        default=None,
+        default='output',
         type=str,
         help='If there is no display interface, you can save it.')
     parser.add_argument('--not-show', default=False, action='store_true')
@@ -140,6 +141,18 @@ def make_grid(imgs, names):
     return visualizer.get_image()
 
 
+def swap_pipeline_position(dataset_cfg):
+    load_ann_tfm_name = 'LoadAnnotations'
+    pipeline = dataset_cfg.get('pipeline')
+    if (pipeline is None):
+        return dataset_cfg
+    all_transform_types = [tfm['type'] for tfm in pipeline]
+    if load_ann_tfm_name in all_transform_types:
+        load_ann_tfm_index = all_transform_types.index(load_ann_tfm_name)
+        load_ann_tfm = pipeline.pop(load_ann_tfm_index)
+        pipeline.insert(1, load_ann_tfm)
+
+
 class InspectCompose(Compose):
     """Compose multiple transforms sequentially.
 
@@ -182,10 +195,11 @@ def main():
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
 
-    # register all modules in mmyolo into the registries
-    register_all_modules()
+    init_default_scope(cfg.get('default_scope', 'mmyolo'))
 
     dataset_cfg = cfg.get(args.phase + '_dataloader').get('dataset')
+    if (args.phase in ['test', 'val']):
+        swap_pipeline_position(dataset_cfg)
     dataset = DATASETS.build(dataset_cfg)
     visualizer = VISUALIZERS.build(cfg.visualizer)
     visualizer.dataset_meta = dataset.metainfo
